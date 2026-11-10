@@ -295,32 +295,33 @@ def _ensure_playable(path: Path, workdir: Path) -> Path:
         return path  # nothing to do
 
     out = workdir / (path.stem + "_apple.mp4")
-    cmd = [FFMPEG, "-y", "-i", str(path)]
-    # Video: copy if already H.264/HEVC, else encode to H.264.
+    cmd = [FFMPEG, "-y", "-threads", "1", "-i", str(path)]
+    # Video: copy if already H.264/HEVC, else encode to H.264 with the lightest
+    # settings (ultrafast + 1 thread) so small/free hosts don't run out of RAM/CPU.
     if video_ok:
         cmd += ["-c:v", "copy"]
     else:
-        cmd += ["-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
-                "-pix_fmt", "yuv420p"]
+        cmd += ["-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
+                "-threads", "1", "-pix_fmt", "yuv420p"]
     # Audio: copy if already AAC, else encode to AAC.
     if audio_ok and acodec is not None:
         cmd += ["-c:a", "copy"]
     elif acodec is not None:
-        cmd += ["-c:a", "aac", "-b:a", "192k"]
+        cmd += ["-c:a", "aac", "-b:a", "160k"]
     cmd += ["-movflags", "+faststart", str(out)]
     try:
         subprocess.run(cmd, capture_output=True, timeout=1800, check=True)
         if out.exists() and out.stat().st_size > 0:
             return out
     except Exception:
-        # If stream-copy failed (e.g. odd container), try a full re-encode once.
+        # If stream-copy failed (e.g. odd container), try a full light re-encode.
         try:
             out2 = workdir / (path.stem + "_apple2.mp4")
             subprocess.run(
-                [FFMPEG, "-y", "-i", str(path),
-                 "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
-                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-                 "-movflags", "+faststart", str(out2)],
+                [FFMPEG, "-y", "-threads", "1", "-i", str(path),
+                 "-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
+                 "-threads", "1", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                 "-b:a", "160k", "-movflags", "+faststart", str(out2)],
                 capture_output=True, timeout=1800, check=True,
             )
             if out2.exists() and out2.stat().st_size > 0:
