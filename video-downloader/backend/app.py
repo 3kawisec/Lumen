@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
@@ -40,7 +41,9 @@ except ImportError as exc:  # pragma: no cover
 # --------------------------------------------------------------------------- #
 
 FRONTEND_DIR = (Path(__file__).resolve().parent.parent / "frontend").resolve()
-HAS_FFMPEG = shutil.which("ffmpeg") is not None
+FFMPEG = shutil.which("ffmpeg")
+FFPROBE = shutil.which("ffprobe")
+HAS_FFMPEG = FFMPEG is not None
 
 # Some sites (Instagram, X, age-gated/private videos) require you to be logged
 # in. Set LUMEN_BROWSER_COOKIES to your browser name to let yt-dlp reuse your
@@ -56,6 +59,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Optional password gate. Set LUMEN_PASSWORD to lock the app behind a simple
+# login (recommended for any public deployment so it isn't open to everyone).
+LUMEN_PASSWORD = os.environ.get("LUMEN_PASSWORD", "").strip() or None
+
+
+@app.middleware("http")
+async def _password_gate(request: Request, call_next):
+    if LUMEN_PASSWORD:
+        import base64, secrets
+        header = request.headers.get("authorization", "")
+        ok = False
+        if header.lower().startswith("basic "):
+            try:
+                decoded = base64.b64decode(header[6:]).decode("utf-8", "ignore")
+                _, _, pw = decoded.partition(":")
+                ok = secrets.compare_digest(pw, LUMEN_PASSWORD)
+            except Exception:
+                ok = False
+        if not ok:
+            from starlette.responses import Response
+            return Response(
+                "Password required.", status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="Lumen"'},
+            )
+    return await call_next(request)
 
 
 @app.exception_handler(Exception)
@@ -209,6 +239,98 @@ def _friendly_error(exc: Exception) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Compatibility: make files play everywhere (QuickTime, iPhone, Messages)
+# --------------------------------------------------------------------------- #
+
+# Codecs Apple devices (iPhone, QuickTime, Photos) play natively. Anything else
+# (VP9, AV1, VP8 video; Opus/Vorbis audio) downloads fine but shows as audio-only,
+# a black screen, or won't save to Photos — so we convert those to H.264 + AAC.
+_APPLE_VIDEO_OK = {"h264", "avc1", "hevc", "h265"}
+_APPLE_AUDIO_OK = {"aac", "mp4a", "alac"}
+
+
+def _codecs(path: Path) -> tuple[Optional[str], Optional[str]]:
+    """Return (video_codec, audio_codec), lowercased, or (None, None) on failure.
+    One stream per CSV line as "type,name", so parsing is order-independent."""
+    if not FFPROBE:
+        return None, None
+    try:
+        out = subprocess.run(
+            [FFPROBE, "-v", "error",
+             "-show_entries", "stream=codec_type,codec_name",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        vcodec = acodec = None
+        for line in out.stdout.splitlines():
+            parts = [p.strip().lower() for p in line.split(",") if p.strip()]
+            if len(parts) < 2:
+                continue
+            # ffprobe's field order isn't guaranteed, so find the type token.
+            ctype = next((p for p in parts if p in ("video", "audio")), None)
+            name = next((p for p in parts if p not in ("video", "audio")), None)
+            if ctype == "video" and vcodec is None:
+                vcodec = name
+            elif ctype == "audio" and acodec is None:
+                acodec = name
+        return vcodec, acodec
+    except Exception:
+        return None, None
+
+
+def _ensure_playable(path: Path, workdir: Path) -> Path:
+    """Guarantee an iPhone-playable H.264 + AAC MP4. Streams that are already
+    compatible are copied (fast, no quality loss); only the incompatible track
+    is re-encoded. Any failure returns the original so a download is never lost."""
+    if not (FFMPEG and FFPROBE):
+        return path
+    vcodec, acodec = _codecs(path)
+    if vcodec is None:  # couldn't probe — leave it alone
+        return path
+
+    video_ok = vcodec in _APPLE_VIDEO_OK
+    audio_ok = (acodec is None) or (acodec in _APPLE_AUDIO_OK)
+    container_ok = path.suffix.lower() in (".mp4", ".m4v", ".mov")
+    if video_ok and audio_ok and container_ok:
+        return path  # nothing to do
+
+    out = workdir / (path.stem + "_apple.mp4")
+    cmd = [FFMPEG, "-y", "-i", str(path)]
+    # Video: copy if already H.264/HEVC, else encode to H.264.
+    if video_ok:
+        cmd += ["-c:v", "copy"]
+    else:
+        cmd += ["-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+                "-pix_fmt", "yuv420p"]
+    # Audio: copy if already AAC, else encode to AAC.
+    if audio_ok and acodec is not None:
+        cmd += ["-c:a", "copy"]
+    elif acodec is not None:
+        cmd += ["-c:a", "aac", "-b:a", "192k"]
+    cmd += ["-movflags", "+faststart", str(out)]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=1800, check=True)
+        if out.exists() and out.stat().st_size > 0:
+            return out
+    except Exception:
+        # If stream-copy failed (e.g. odd container), try a full re-encode once.
+        try:
+            out2 = workdir / (path.stem + "_apple2.mp4")
+            subprocess.run(
+                [FFMPEG, "-y", "-i", str(path),
+                 "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                 "-movflags", "+faststart", str(out2)],
+                capture_output=True, timeout=1800, check=True,
+            )
+            if out2.exists() and out2.stat().st_size > 0:
+                return out2
+        except Exception:
+            pass
+    return path
+
+
+# --------------------------------------------------------------------------- #
 # API
 # --------------------------------------------------------------------------- #
 
@@ -273,8 +395,10 @@ def api_download(req: DownloadRequest):
     else:
         fid = (req.format_id or "").strip()
         if not fid or fid == "best":
-            # Highest-quality video + audio, merged into one file.
-            opts["format"] = "bv*+ba/b" if HAS_FFMPEG else "b[ext=mp4]/b"
+            # Prefer H.264 + AAC (plays on Apple devices with no transcode);
+            # fall back to the outright best, which we transcode afterward.
+            opts["format"] = ("bv*[vcodec^=avc]+ba[acodec^=mp4a]/bv*+ba/b"
+                              if HAS_FFMPEG else "b[ext=mp4]/b")
         else:
             # A specific resolution. If it's video-only, add the best audio.
             opts["format"] = f"{fid}+ba/{fid}/b" if HAS_FFMPEG else f"{fid}/b"
@@ -300,6 +424,10 @@ def api_download(req: DownloadRequest):
             cleanup()
             raise HTTPException(status_code=500, detail="Download finished but no file was produced.")
         final = candidates[0]
+
+    # Make sure the result plays everywhere (transcode VP9/AV1 -> H.264 if needed).
+    if not req.audio_only:
+        final = _ensure_playable(final, workdir)
 
     title = _sanitize_filename(info.get("title") or "video")
     download_name = f"{title}{final.suffix}"
@@ -333,8 +461,12 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", "8000"))
-    print("\n  Lumen is running!  Open  ->  http://127.0.0.1:%d\n" % port)
+    # Local default is 127.0.0.1 (private). On a host, set HOST=0.0.0.0 so the
+    # platform can route traffic to it (Render/Railway/Fly set PORT for you).
+    host = os.environ.get("HOST", "127.0.0.1")
+    where = "your deployment URL" if host == "0.0.0.0" else f"http://127.0.0.1:{port}"
+    print(f"\n  Lumen is running!  Open  ->  {where}\n")
     if not HAS_FFMPEG:
         print("  Note: ffmpeg not found. Highest-res merging & mp3 will be limited.")
         print("  Install ffmpeg for best quality (see README).\n")
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    uvicorn.run(app, host=host, port=port)
